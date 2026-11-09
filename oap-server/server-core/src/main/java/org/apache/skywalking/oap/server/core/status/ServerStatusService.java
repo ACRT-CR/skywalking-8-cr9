@@ -20,8 +20,11 @@ package org.apache.skywalking.oap.server.core.status;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Properties;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
+import org.apache.skywalking.oap.server.core.CoreModuleConfig;
+import org.apache.skywalking.oap.server.library.module.ApplicationConfiguration;
 import org.apache.skywalking.oap.server.library.module.ModuleManager;
 import org.apache.skywalking.oap.server.library.module.Service;
 import org.apache.skywalking.oap.server.telemetry.TelemetryModule;
@@ -38,6 +41,7 @@ import org.apache.skywalking.oap.server.telemetry.api.MetricsTag;
 @RequiredArgsConstructor
 public class ServerStatusService implements Service {
     private final ModuleManager manager;
+    private final CoreModuleConfig moduleConfig;
     @Getter
     private BootingStatus bootingStatus = new BootingStatus();
     @Getter
@@ -45,7 +49,9 @@ public class ServerStatusService implements Service {
 
     private List<ServerStatusWatcher> statusWatchers = new ArrayList<>();
 
-    public void bootedNow(long uptime) {
+    private List<ApplicationConfiguration.ModuleConfiguration> configurations;
+
+    public void bootedNow(List<ApplicationConfiguration.ModuleConfiguration> configurations, long uptime) {
         bootingStatus.setBooted(true);
         bootingStatus.setUptime(uptime);
         manager.find(TelemetryModule.NAME)
@@ -55,6 +61,7 @@ public class ServerStatusService implements Service {
                // Set uptime to second
                .setValue(uptime / 1000d);
         this.statusWatchers.forEach(watcher -> watcher.onServerBooted(bootingStatus));
+        this.configurations = configurations;
     }
 
     public void rebalancedCluster(long rebalancedTime) {
@@ -62,7 +69,10 @@ public class ServerStatusService implements Service {
         manager.find(TelemetryModule.NAME)
                .provider()
                .getService(MetricsCreator.class)
-               .createGauge("cluster_rebalanced_time", "oap cluster rebalanced time after scale", MetricsTag.EMPTY_KEY, MetricsTag.EMPTY_VALUE)
+               .createGauge(
+                   "cluster_rebalanced_time", "oap cluster rebalanced time after scale", MetricsTag.EMPTY_KEY,
+                   MetricsTag.EMPTY_VALUE
+               )
                .setValue(rebalancedTime / 1000d);
 
         this.statusWatchers.forEach(watcher -> watcher.onClusterRebalanced(clusterStatus));
@@ -70,5 +80,70 @@ public class ServerStatusService implements Service {
 
     public void registerWatcher(ServerStatusWatcher watcher) {
         this.statusWatchers.add(watcher);
+    }
+
+    /**
+     * Mask the configuration value if the key contains any masking keyword.
+     *
+     * @param configKey   the configuration key to check
+     * @param configValue the configuration value to mask
+     * @param keywords    the keywords for masking secrets
+     * @return masked value "******" if key matches any keyword, otherwise return the original value
+     */
+    private String maskConfigValue(String configKey, String configValue, String[] keywords) {
+        String lowerConfigKey = configKey.toLowerCase();
+        for (String keyword : keywords) {
+            if (lowerConfigKey.contains(keyword.toLowerCase())) {
+                return "******";
+            }
+        }
+        return configValue;
+    }
+
+    /**
+     * @return a complete list of booting configurations with effected values.
+     * @since 9.7.0
+     */
+    public String dumpBootingConfigurations(String keywords4MaskingSecretsOfConfig) {
+        if (configurations == null || configurations.isEmpty()) {
+            return "No available booting configurations.";
+        }
+        final String[] keywords = keywords4MaskingSecretsOfConfig.split(",");
+        StringBuilder configList = new StringBuilder();
+        for (ApplicationConfiguration.ModuleConfiguration configuration : configurations) {
+            final String moduleName = configuration.getModuleName();
+            if (configuration.getProviders().size() == 1) {
+                configList.append(moduleName)
+                          .append(".provider=")
+                          .append(configuration.getProviders().keySet().iterator().next())
+                          .append("\n");
+            }
+            configuration.getProviders().forEach(
+                (providerName, providerConfiguration) ->
+                    providerConfiguration.getProperties().forEach(
+                        (key, value) -> {
+                            if (value instanceof Properties) {
+                                Properties properties = (Properties) value;
+                                properties.forEach((k, v) -> {
+                                    String configKey = moduleName + "." + providerName + "." + key + "." + k;
+                                    String configValue = maskConfigValue(k.toString(), v.toString(), keywords);
+                                    configList.append(configKey)
+                                              .append("=")
+                                              .append(configValue)
+                                              .append("\n");
+                                });
+                            } else {
+                                String configKey = moduleName + "." + providerName + "." + key;
+                                String configValue = maskConfigValue(key.toString(), value.toString(), keywords);
+                                configList.append(configKey)
+                                          .append("=")
+                                          .append(configValue)
+                                          .append("\n");
+                            }
+                        }
+                    )
+            );
+        }
+        return configList.toString();
     }
 }
